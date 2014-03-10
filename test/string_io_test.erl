@@ -1,7 +1,7 @@
 
--module(string_io_test).
+-module( string_io_test ).
 
--export( [main/1,all/0] ).
+-export( [main/1, all/0] ).
 
 
 main(_A) ->
