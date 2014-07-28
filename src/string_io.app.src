@@ -1,0 +1,11 @@
+{application, string_io,
+ [
+  {description, "string_io"},
+  {vsn, "1"},
+  {registered, []},
+  {applications, [
+                  kernel,
+                  stdlib
+                 ]},
+  {env, []}
+ ]}.
