@@ -46,7 +46,7 @@ close( Server ) ->
 open( String, Modes )
 		when is_list( String ) ->
 	case decode( Modes ) of
-	error -> erlang:throw( {error, {mode, Modes}} );
+	error -> erlang:error( {mode, Modes} );
 	Mode ->
 		Caller = erlang:self(),
 		Fun = fun ( ) ->
@@ -81,26 +81,21 @@ decode( Modes ) ->
 
 
 % input
+%	Is_readable : boolean(), is the string buffer readable?
+%	Length : integer(), how many chars in String_buffer
 %	How_many : integer(), how many chars that should be read
 %	String_buffer : #string_buffer{}
 % return
 %	{Read, #string_buffer{}}
-%		Read : string() | eof
-get_chars( How_many, String_buffer ) ->
-	case string_buffer_remaining_length( String_buffer ) of
-	0 -> {eof, String_buffer};
-	Length ->
-		case (Length > How_many) of
-		true ->
-			% take some of the remaining
-			Read = string_buffer_remaining( String_buffer, How_many ),
-			{Read, string_buffer_after_read( String_buffer, How_many )};
-		false ->
-			% take all of the remaining
-			Remaining = string_buffer_remaining( String_buffer ),
-			{Remaining, string_buffer_after_read( String_buffer, all_read )}
-		end
-	end.
+%		Read : string() | eof | {error, {mode, is_writeonly}}
+get_chars( false, _Length, _How_many, String_buffer ) -> {{error, {mode, is_writeonly}}, String_buffer};
+get_chars( true, 0, _How_many, String_buffer ) -> {eof, String_buffer};
+get_chars( true, Length, How_many, String_buffer ) when (Length > How_many) ->
+	Read = string_buffer_remaining( String_buffer, How_many ),
+	{Read, string_buffer_after_read( String_buffer, How_many )};
+get_chars( true, _Length, _How_many, String_buffer ) ->
+	Remaining = string_buffer_remaining( String_buffer ),
+	{Remaining, string_buffer_after_read( String_buffer, all_read )}.
 
 
 % input
@@ -115,25 +110,23 @@ get_chars( How_many, String_buffer ) ->
 % return
 %	{Result, #string_buffer{}}
 %		Result : ok | {error, Reason}
-get_until( Module, Function, Arguments, Cont, String_buffer ) ->
+get_until( false, _Module, _Function, _Arguments, _Cont, String_buffer ) ->
+	{{error, {mode, is_writeonly}}, String_buffer};
+get_until( true, Module, Function, Arguments, Cont, String_buffer ) ->
 	String = string_buffer_remaining( String_buffer ),
-	case catch erlang:apply(Module, Function, [Cont, String | Arguments]) of
-	{done, Result, eof} ->
-		{Result, string_buffer_after_read( String_buffer, all_read )};
-	{done, Result, Chars_remaining} ->
-		{Result,
-			string_buffer_after_read( String_buffer, Chars_remaining )};
-	{more, Cont_New} ->
-		% we do not have any more characters.
-		% try again with emptied String_buffer
-		get_until( Module,
-			Function,
-			Arguments,
-			Cont_New,
-			string_buffer_after_read( String_buffer, all_read ) );
-	_Other -> {{error, {apply, Module, Function, Arguments}}, String_buffer}
-	end.
+	Result = (catch erlang:apply( Module, Function, [Cont, String | Arguments] )),
+	get_until( Result, {Module, Function, Arguments}, String_buffer ).
 
+get_until( {done, Result, eof}, _MFA, String_buffer ) ->
+	{Result, string_buffer_after_read( String_buffer, all_read )};
+get_until( {done, Result, Chars_remaining}, _MFA, String_buffer ) ->
+	{Result, string_buffer_after_read( String_buffer, Chars_remaining )};
+get_until( {more, Cont}, {M, F, A}, String_buffer ) ->
+	% we do not have any more characters.
+	% try again with empty String_buffer
+	get_until( true, M, F, A, Cont, string_buffer_after_read(String_buffer, all_read) );
+get_until( _Other, MFA, String_buffer ) ->
+	{{error, {apply, MFA}}, String_buffer}.
 
 % input
 %	Request : tuple()
@@ -142,26 +135,23 @@ get_until( Module, Function, Arguments, Cont, String_buffer ) ->
 %	{Result, #string_buffer{}}
 %		Result : ok | {error, Reason}
 io_request( {put_chars, Chars}, {ok, String_buffer} ) ->
-	case string_buffer_is_writeable( String_buffer ) of
-	true -> put_chars( Chars, String_buffer );
-	false -> {{error, {mode, is_readonly}}, String_buffer}
-	end;
+	put_chars( string_buffer_is_writeable(String_buffer), Chars, String_buffer );
+io_request( {put_chars, unicode, Chars}, {ok, String_buffer} ) ->
+	put_chars( string_buffer_is_writeable(String_buffer), Chars, String_buffer );
 io_request( {put_chars, Module, Func, Args}, String_buffer ) ->
 	io_request( {put_chars, catch erlang:apply( Module, Func, Args )}, String_buffer );
+io_request( {put_chars, unicode, Module, Func, Args}, String_buffer ) ->
+	io_request( {put_chars, unicode, catch erlang:apply( Module, Func, Args )}, String_buffer );
 io_request( {get_chars, _Prompt, How_many}, {ok, String_buffer} ) ->
-	case string_buffer_is_readable( String_buffer ) of
-	true -> get_chars( How_many, String_buffer );
-	false -> {{error, {mode, is_writeonly}}, String_buffer}
-	end;
+	get_chars( string_buffer_is_readable(String_buffer), string_buffer_remaining_length(String_buffer), How_many, String_buffer );
+io_request( {get_chars, unicode, _Prompt, How_many}, {ok, String_buffer} ) ->
+	get_chars( string_buffer_is_readable(String_buffer), string_buffer_remaining_length(String_buffer), How_many, String_buffer );
 io_request( {get_until, _Prompt, Module, Func, Args}, {ok, String_buffer} ) ->
-	case string_buffer_is_readable(String_buffer) of
-	true -> get_until( Module, Func, Args, [], String_buffer );
-	false -> {{error, {mode, is_writeonly}}, String_buffer}
-	end;
+	get_until( string_buffer_is_readable(String_buffer), Module, Func, Args, [], String_buffer );
+io_request( {get_until, unicode, _Prompt, Module, Func, Args}, {ok, String_buffer} ) ->
+	get_until( string_buffer_is_readable(String_buffer), Module, Func, Args, [], String_buffer );
 io_request( {requests, Requests}, {ok, String_buffer} ) ->
-	Fun = fun( Request, Acc ) ->
-			io_request( Request, Acc )
-		end,
+	Fun = fun( Request, Acc ) -> io_request( Request, Acc ) end,
 	lists:foldl( Fun, {ok, String_buffer}, Requests );
 io_request( Request, {_Status, String_buffer} ) ->
 	{{error, {request_unknown, Request}}, String_buffer}.
@@ -188,13 +178,12 @@ loop( String_buffer ) ->
 % transform binary to list in input
 % return tuple
 %	{Result, #string_buffer{}}
-put_chars( Binary, String_buffer )
-		when is_binary(Binary) ->
-	put_chars( erlang:binary_to_list(Binary), String_buffer );
-put_chars( Chars, String_buffer )
-		when is_list(Chars) ->
+put_chars( false, _Binary, String_buffer ) ->{{error, {mode, is_readonly}}, String_buffer};
+put_chars( true, Binary, String_buffer ) when is_binary(Binary) ->
+	put_chars( true, erlang:binary_to_list(Binary), String_buffer );
+put_chars( true, Chars, String_buffer ) when is_list(Chars) ->
 	{ok, string_buffer_after_write( String_buffer, Chars )};
-put_chars( Error, String_buffer ) ->
+put_chars( true, Error, String_buffer ) ->
 	{{error, Error}, String_buffer}.
 
 
